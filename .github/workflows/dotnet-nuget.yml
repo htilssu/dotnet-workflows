@@ -1,0 +1,172 @@
+name: .NET NuGet (reusable)
+
+# Reusable workflow: build, test, pack and push NuGet packages.
+#
+# Call it from another workflow:
+#
+#   jobs:
+#     nuget:
+#       uses: htilssu/dotnet-workflows/.github/workflows/dotnet-nuget.yml@v1
+#       permissions:
+#         contents: read
+#         packages: write        # required even when pushing elsewhere (the publish job requests it)
+#       with:
+#         solution: MySolution.slnx
+#         pack-projects: |
+#           src/My.Library/My.Library.csproj
+#
+# Behaviour:
+# - pull_request events never push, regardless of `publish`.
+# - Default target is GitHub Packages of the repository owner, authenticated with the caller's GITHUB_TOKEN.
+#   Pass `package-source` + secret NUGET_API_KEY to push somewhere else (e.g. nuget.org).
+# - Checkout uses full history so tag-based versioning (MinVer, GitVersion, ...) works.
+
+on:
+  workflow_call:
+    inputs:
+      dotnet-version:
+        description: .NET SDK version(s) for actions/setup-dotnet (multi-line allowed).
+        type: string
+        default: 10.0.x
+      solution:
+        description: Solution or project to restore/build/test. Empty = the single solution/project at the repo root.
+        type: string
+        default: ''
+      pack-projects:
+        description: Newline-separated projects to pack. Empty = pack `solution` (only projects with IsPackable=true).
+        type: string
+        default: ''
+      configuration:
+        type: string
+        default: Release
+      run-tests:
+        type: boolean
+        default: true
+      publish:
+        description: Push packages after a successful build. Ignored (always false) on pull_request.
+        type: boolean
+        default: true
+      package-source:
+        description: NuGet push source. Empty = https://nuget.pkg.github.com/<owner>/index.json
+        type: string
+        default: ''
+      artifact-name:
+        type: string
+        default: nuget-packages
+    secrets:
+      NUGET_API_KEY:
+        description: API key for `package-source`. Empty = the caller's GITHUB_TOKEN (GitHub Packages).
+        required: false
+    outputs:
+      packages:
+        description: Space-separated file names of the produced .nupkg files.
+        value: ${{ jobs.build.outputs.packages }}
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      packages: ${{ steps.pack.outputs.packages }}
+    env:
+      SOLUTION: ${{ inputs.solution }}
+      PACK_PROJECTS: ${{ inputs.pack-projects }}
+      CONFIGURATION: ${{ inputs.configuration }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # tag-based versioning needs full history + tags
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+
+      - name: Restore
+        shell: bash
+        run: dotnet restore ${SOLUTION:+"$SOLUTION"}
+
+      - name: Build
+        shell: bash
+        run: dotnet build ${SOLUTION:+"$SOLUTION"} -c "$CONFIGURATION" --no-restore
+
+      - name: Test
+        if: inputs.run-tests
+        shell: bash
+        run: >
+          dotnet test ${SOLUTION:+"$SOLUTION"} -c "$CONFIGURATION" --no-build
+          --logger "trx;LogFileName=results.trx" --results-directory TestResults
+
+      - name: Pack
+        id: pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${PACK_PROJECTS//[[:space:]]/}" ]]; then
+            dotnet pack ${SOLUTION:+"$SOLUTION"} -c "$CONFIGURATION" --no-build -o artifacts
+          else
+            while IFS= read -r project; do
+              project="$(echo "$project" | xargs)"
+              [[ -z "$project" ]] && continue
+              dotnet pack "$project" -c "$CONFIGURATION" --no-build -o artifacts
+            done <<< "$PACK_PROJECTS"
+          fi
+
+          shopt -s nullglob
+          packages=(artifacts/*.nupkg)
+          if (( ${#packages[@]} == 0 )); then
+            echo "::error::No .nupkg produced. Set IsPackable=true or pass pack-projects."
+            exit 1
+          fi
+
+          names="$(printf '%s\n' "${packages[@]}" | xargs -n1 basename | tr '\n' ' ')"
+          echo "packages=${names% }" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Packages"
+            printf '%s\n' "${packages[@]}" | xargs -n1 basename | sed 's/^/- /'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: artifacts/*.nupkg
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v7
+        if: always() && inputs.run-tests
+        with:
+          name: ${{ inputs.artifact-name }}-test-results
+          path: TestResults/
+          if-no-files-found: ignore
+
+  publish:
+    needs: build
+    if: inputs.publish && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: artifacts
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: ${{ inputs.dotnet-version }}
+
+      - name: Push packages
+        shell: bash
+        env:
+          PACKAGE_SOURCE: ${{ inputs.package-source || format('https://nuget.pkg.github.com/{0}/index.json', github.repository_owner) }}
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY || github.token }}
+        run: |
+          dotnet nuget push "artifacts/*.nupkg" \
+            --source "$PACKAGE_SOURCE" \
+            --api-key "$NUGET_API_KEY" \
+            --skip-duplicate
