@@ -17,6 +17,8 @@ name: .NET NuGet (reusable)
 #
 # Behaviour:
 # - pull_request events never push, regardless of `publish`.
+# - Restore also uses the owner's GitHub Packages feed (caller's GITHUB_TOKEN). Private packages there must grant
+#   the calling repo Actions access (Package settings -> Manage Actions access).
 # - Default target is GitHub Packages of the repository owner, authenticated with the caller's GITHUB_TOKEN.
 #   Pass `package-source` + secret NUGET_API_KEY to push somewhere else (e.g. nuget.org).
 # - Checkout uses full history so tag-based versioning (MinVer, GitVersion, ...) works.
@@ -72,6 +74,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      packages: read # restore private dependencies from the owner's GitHub Packages feed
     outputs:
       packages: ${{ steps.pack.outputs.packages }}
     env:
@@ -86,6 +89,19 @@ jobs:
       - uses: actions/setup-dotnet@v6
         with:
           dotnet-version: ${{ inputs.dotnet-version }}
+
+      - name: Add GitHub Packages source
+        shell: bash
+        env:
+          GH_PACKAGES_URL: https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json
+          GH_PACKAGES_USER: ${{ github.repository_owner }}
+          GH_PACKAGES_TOKEN: ${{ github.token }}
+        run: >
+          dotnet nuget add source "$GH_PACKAGES_URL"
+          --name github-packages-owner
+          --username "$GH_PACKAGES_USER"
+          --password "$GH_PACKAGES_TOKEN"
+          --store-password-in-clear-text
 
       - name: Restore
         shell: bash
